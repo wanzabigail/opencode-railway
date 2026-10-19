@@ -20,7 +20,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \
     OPENCODE_DISABLE_AUTOUPDATE=true \
     OPENCODE_AUTO_UPDATE=true \
-    OPENCODE_AUTO_UPDATE_INTERVAL=21600
+    OPENCODE_AUTO_UPDATE_INTERVAL=21600 \
+    OPENCODE_LOW_RESOURCE=true
 
 # tini            : init/PID 1 agar sinyal & zombie process rapi
 # git, curl, ssh  : kebutuhan agent di dalam container
@@ -44,6 +45,7 @@ RUN npm install -g "@opencode/cli@${OPENCODE_VERSION}" --no-audit --no-fund \
 # Dibuat di image supaya tetap jalan walau volume belum terpasang.
 RUN mkdir -p /data/workspace /data/home
 
+COPY low-resource.json /opt/opencode/low-resource.json
 COPY start.sh /usr/local/bin/start-opencode.sh
 RUN chmod 0755 /usr/local/bin/start-opencode.sh
 

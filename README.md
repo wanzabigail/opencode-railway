@@ -107,6 +107,7 @@ curl -u "opencode:<PASSWORD>" <URL>/api/info
 | `OPENCODE_DISABLE_AUTOUPDATE` | tidak | `true` | Matikan updater internal OpenCode |
 | `OPENCODE_AUTO_UPDATE` | tidak | `true` | Supervisor cek & pasang versi npm terbaru |
 | `OPENCODE_AUTO_UPDATE_INTERVAL` | tidak | `21600` | Interval cek update (detik, min. 300) |
+| `OPENCODE_LOW_RESOURCE` | tidak | `true` | Profil hemat RAM/CPU |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GROQ_API_KEY`, `OPENCODE_API_KEY` | tidak | – | Kredensial provider model |
 | `OPENAI_BASE_URL`, `DEEPSEEK_BASE_URL`, `OPENROUTER_BASE_URL` | tidak | – | Endpoint OpenAI-compatible |
 
@@ -137,6 +138,42 @@ OPENCODE_AUTO_UPDATE_INTERVAL=3600
 > Update yang dipasang saat runtime hanya bertahan sampai container
 > di-redeploy. Setelah redeploy, image tetap dibangun dengan
 > `@opencode/cli@latest` dari Dockerfile, jadi tetap versi terbaru.
+
+## Hemat RAM & CPU
+
+Default container memakai **profil hemat** (`OPENCODE_LOW_RESOURCE=true`).
+
+**Level OpenCode** — `start.sh` menulis `low-resource.json` ke
+`$HOME/.config/opencode/opencode.json` dan menyalakan env berikut:
+
+| Item | Efek | Trade-off |
+| --- | --- | --- |
+| `lsp: false` | Tidak menjalankan language server | Tanpa diagnostic/hover |
+| `formatter: false` | Tidak format otomatis setelah edit | Format manual |
+| `snapshots: false` | Tidak capture snapshot git tiap step | `/undo` tidak memulihkan file |
+| `warming: false` | Tidak ada request keep-alive berkala | – |
+| `plugins: []` | Tidak memuat plugin | Tidak ada plugin |
+| `update: "disable"` | Tidak cek update dari UI | Update lewat supervisor |
+| `OPENCODE_DISABLE_FILEWATCHER` | Matikan watcher filesystem | File tree tidak auto-refresh |
+| `OPENCODE_DISABLE_MODELS_FETCH` | Tidak fetch daftar model berkala | – |
+| `OPENCODE_DISABLE_CLAUDE_CODE(_SKILLS)` | Tidak memindai `.claude/` | Tanpa skill Claude Code |
+
+> Config hanya ditulis kalau belum ada. Kalau Anda sudah punya config kustom di
+> volume, file itu **tidak** ditimpa.
+
+**Level Railway:**
+- `overlapSeconds: 0` + `drainingSeconds: 10` — saat deploy, container lama
+  langsung dimatikan (tidak ada dua container jalan bersamaan).
+- `restartPolicyType: ON_FAILURE`, `restartPolicyMaxRetries: 10`.
+- **App Sleeping** (opsional, diset di dashboard/API): service tidur saat tidak
+  ada traffic → paling menghemat, tapi request pertama jadi lambat (cold start).
+  Aktifkan di dashboard Railway → service → Settings → *App Sleeping*.
+
+Matikan profil hemat bila butuh fitur penuh:
+
+```bash
+OPENCODE_LOW_RESOURCE=false
+```
 
 ## Build & jalankan lokal
 

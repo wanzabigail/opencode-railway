@@ -48,7 +48,50 @@ if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Konfigurasi auto-update
+# 3. Profil hemat RAM/CPU
+#
+# Menyalakan flag yang mematikan pekerjaan latar belakang (file watcher,
+# fetch daftar model, pemindaian Claude Code) dan memasang config OpenCode
+# hemat resource (LSP, formatter, snapshot, warming, plugin mati).
+# ---------------------------------------------------------------------------
+LOW_RESOURCE="${OPENCODE_LOW_RESOURCE:-true}"
+case "$LOW_RESOURCE" in
+    1|true|yes|on) LOW_RESOURCE=true ;;
+    *)             LOW_RESOURCE=false ;;
+esac
+
+TEMPLATE="${OPENCODE_LOW_RESOURCE_CONFIG:-/opt/opencode/low-resource.json}"
+[ -f "$TEMPLATE" ] || TEMPLATE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/low-resource.json"
+CONFIG_TARGET="$XDG_CONFIG_HOME/opencode/opencode.json"
+
+apply_low_resource() {
+    if [ "$LOW_RESOURCE" = true ]; then
+        export OPENCODE_DISABLE_FILEWATCHER="${OPENCODE_DISABLE_FILEWATCHER:-true}"
+        export OPENCODE_DISABLE_MODELS_FETCH="${OPENCODE_DISABLE_MODELS_FETCH:-true}"
+        export OPENCODE_DISABLE_CLAUDE_CODE="${OPENCODE_DISABLE_CLAUDE_CODE:-true}"
+        export OPENCODE_DISABLE_CLAUDE_CODE_SKILLS="${OPENCODE_DISABLE_CLAUDE_CODE_SKILLS:-true}"
+
+        if [ ! -f "$TEMPLATE" ]; then
+            warn "Profil hemat: template config tidak ditemukan (${TEMPLATE}); dilewati."
+            return 0
+        fi
+        mkdir -p "$(dirname "$CONFIG_TARGET")"
+        if [ ! -f "$CONFIG_TARGET" ] || cmp -s "$CONFIG_TARGET" "$TEMPLATE"; then
+            cp "$TEMPLATE" "$CONFIG_TARGET"
+        else
+            log "Profil hemat: config kustom ada di ${CONFIG_TARGET}; tidak ditimpa."
+        fi
+    else
+        if [ -f "$CONFIG_TARGET" ] && [ -f "$TEMPLATE" ] && cmp -s "$CONFIG_TARGET" "$TEMPLATE"; then
+            rm -f "$CONFIG_TARGET"
+            log "Profil hemat: config bawaan dihapus."
+        fi
+    fi
+}
+apply_low_resource
+
+# ---------------------------------------------------------------------------
+# 4. Konfigurasi auto-update
 # ---------------------------------------------------------------------------
 AUTO_UPDATE="${OPENCODE_AUTO_UPDATE:-true}"
 case "$AUTO_UPDATE" in
@@ -63,7 +106,7 @@ esac
 [ "$UPDATE_INTERVAL" -ge 300 ] 2>/dev/null || UPDATE_INTERVAL=300
 
 # ---------------------------------------------------------------------------
-# 4. Supervisor
+# 5. Supervisor
 # ---------------------------------------------------------------------------
 SHUTDOWN=0
 SERVER_PID=""
@@ -130,6 +173,11 @@ if [ "$AUTO_UPDATE" = true ]; then
     log "Auto-update: aktif (interval ${UPDATE_INTERVAL}s)"
 else
     log "Auto-update: nonaktif"
+fi
+if [ "$LOW_RESOURCE" = true ]; then
+    log "Profil hemat: aktif (LSP/formatter/snapshot/warming off, watcher off)"
+else
+    log "Profil hemat: nonaktif"
 fi
 
 while :; do

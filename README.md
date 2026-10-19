@@ -108,6 +108,7 @@ curl -u "opencode:<PASSWORD>" <URL>/api/info
 | `OPENCODE_AUTO_UPDATE` | tidak | `true` | Supervisor cek & pasang versi npm terbaru |
 | `OPENCODE_AUTO_UPDATE_INTERVAL` | tidak | `21600` | Interval cek update (detik, min. 300) |
 | `OPENCODE_LOW_RESOURCE` | tidak | `true` | Profil hemat RAM/CPU |
+| `OPENCODE_HOME` | tidak | `/data/home` | Lokasi state/config (di volume) |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GROQ_API_KEY`, `OPENCODE_API_KEY` | tidak | – | Kredensial provider model |
 | `OPENAI_BASE_URL`, `DEEPSEEK_BASE_URL`, `OPENROUTER_BASE_URL` | tidak | – | Endpoint OpenAI-compatible |
 

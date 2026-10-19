@@ -22,9 +22,10 @@ die()  { printf '[opencode] ERROR: %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 export PORT="${PORT:-8080}"
 
-# HOME diarahkan ke volume supaya config, session, credential, dan cache
-# OpenCode ikut persisten saat redeploy.
-export HOME="${HOME:-/data/home}"
+# HOME dipaksa ke volume supaya config, session, credential, dan cache
+# OpenCode ikut persisten saat redeploy. Jangan pakai "${HOME:-...}" karena
+# Railway sudah meng-inject HOME=/root (ephemeral). Override dengan OPENCODE_HOME.
+export HOME="${OPENCODE_HOME:-/data/home}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"

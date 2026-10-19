@@ -1,0 +1,15 @@
+# Secrets & state lokal
+.env
+.env.*
+!.env.example
+.deploy-credentials
+*.log
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

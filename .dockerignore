@@ -1,0 +1,9 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.deploy-credentials
+*.log
+node_modules
+README.md

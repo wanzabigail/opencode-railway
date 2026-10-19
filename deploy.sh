@@ -113,6 +113,8 @@ set_var NODE_ENV "production"
 set_var PORT "$APP_PORT"
 set_var OPENCODE_SERVER_PASSWORD "$OPENCODE_SERVER_PASSWORD"
 set_var OPENCODE_DISABLE_AUTOUPDATE "true"
+set_var OPENCODE_AUTO_UPDATE "${OPENCODE_AUTO_UPDATE:-true}"
+set_var OPENCODE_AUTO_UPDATE_INTERVAL "${OPENCODE_AUTO_UPDATE_INTERVAL:-21600}"
 
 # Provider model (opsional). Hanya yang terisi yang dikirim.
 for var in \

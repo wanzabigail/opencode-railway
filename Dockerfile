@@ -18,7 +18,9 @@ ARG OPENCODE_VERSION=latest
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NODE_ENV=production \
-    OPENCODE_DISABLE_AUTOUPDATE=true
+    OPENCODE_DISABLE_AUTOUPDATE=true \
+    OPENCODE_AUTO_UPDATE=true \
+    OPENCODE_AUTO_UPDATE_INTERVAL=21600
 
 # tini            : init/PID 1 agar sinyal & zombie process rapi
 # git, curl, ssh  : kebutuhan agent di dalam container

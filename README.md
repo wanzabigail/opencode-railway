@@ -104,13 +104,39 @@ curl -u "opencode:<PASSWORD>" <URL>/api/info
 | --- | --- | --- | --- |
 | `OPENCODE_SERVER_PASSWORD` | ya | digenerate | Password web UI/API |
 | `PORT` | tidak | `8080` | Di-inject Railway |
-| `OPENCODE_DISABLE_AUTOUPDATE` | tidak | `true` | Cegah update saat runtime |
+| `OPENCODE_DISABLE_AUTOUPDATE` | tidak | `true` | Matikan updater internal OpenCode |
+| `OPENCODE_AUTO_UPDATE` | tidak | `true` | Supervisor cek & pasang versi npm terbaru |
+| `OPENCODE_AUTO_UPDATE_INTERVAL` | tidak | `21600` | Interval cek update (detik, min. 300) |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GROQ_API_KEY`, `OPENCODE_API_KEY` | tidak | – | Kredensial provider model |
 | `OPENAI_BASE_URL`, `DEEPSEEK_BASE_URL`, `OPENROUTER_BASE_URL` | tidak | – | Endpoint OpenAI-compatible |
 
 `OPENCODE_SERVER_PASSWORD` **wajib** di-set di Railway. Kalau kosong, container
 membuat password acak dan menuliskannya di log — artinya password berubah tiap
 restart.
+
+## Auto-update
+
+Container menjalankan supervisor di `start.sh`:
+
+1. Setiap `OPENCODE_AUTO_UPDATE_INTERVAL` detik, cek versi stabil terbaru
+   `@opencode/cli` di npm.
+2. Kalau versi npm lebih baru, jalankan `npm install -g` versi tersebut.
+3. Hentikan `opencode serve`, lalu jalankan ulang dengan binary baru.
+
+Supervisor juga me-restart server yang crash, dan keluar setelah 5 crash
+berturut-turut (< 10 detik) agar Railway me-restart container.
+
+```bash
+# matikan auto-update
+OPENCODE_AUTO_UPDATE=false
+
+# cek tiap 1 jam
+OPENCODE_AUTO_UPDATE_INTERVAL=3600
+```
+
+> Update yang dipasang saat runtime hanya bertahan sampai container
+> di-redeploy. Setelah redeploy, image tetap dibangun dengan
+> `@opencode/cli@latest` dari Dockerfile, jadi tetap versi terbaru.
 
 ## Build & jalankan lokal
 

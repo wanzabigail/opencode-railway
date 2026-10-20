@@ -62,6 +62,25 @@ if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ] && [ -f .deploy-credentials ]; then
     . ./.deploy-credentials
 fi
 
+# Saat script dijalankan dari dalam container Railway, Railway menyuntikkan
+# RAILWAY_PROJECT_ID/ENVIRONMENT_ID/SERVICE_ID runtime. Railway CLI memberi
+# prioritas pada variabel itu di atas project yang di-link, sehingga deploy
+# bisa nyasar ke service tempat script berjalan. Hapus metadata runtime saja;
+# RAILWAY_TOKEN / RAILWAY_API_TOKEN tetap dipakai untuk autentikasi.
+RAILWAY_RUNTIME=0
+if [ -n "${RAILWAY_DEPLOYMENT_ID:-}" ] || [ -n "${RAILWAY_REPLICA_ID:-}" ]; then
+    RAILWAY_RUNTIME=1
+    info "Terdeteksi runtime Railway; mengabaikan metadata RAILWAY_* runtime."
+    unset RAILWAY_PROJECT_ID RAILWAY_PROJECT_NAME RAILWAY_ENVIRONMENT \
+          RAILWAY_ENVIRONMENT_ID RAILWAY_ENVIRONMENT_NAME \
+          RAILWAY_SERVICE_ID RAILWAY_SERVICE_NAME \
+          RAILWAY_PRIVATE_DOMAIN RAILWAY_PUBLIC_DOMAIN RAILWAY_STATIC_URL \
+          RAILWAY_DEPLOYMENT_ID RAILWAY_REPLICA_ID RAILWAY_SNAPSHOT_ID
+    while IFS= read -r _railway_var; do
+        unset "$_railway_var"
+    done < <(compgen -v | grep -E '^RAILWAY_SERVICE_.*_URL$' || true)
+fi
+
 # Nilai lama dipakai sebagai fallback kalau pengecekan networking gagal.
 PREVIOUS_PUBLIC_URL="${OPENCODE_PUBLIC_URL:-}"
 PREVIOUS_TCP_ADDRESS="${OPENCODE_TCP_ADDRESS:-}"
@@ -130,6 +149,9 @@ fi
 # Project & service
 # ---------------------------------------------------------------------------
 if ! railway status --json >/dev/null 2>&1; then
+    if [ "$RAILWAY_RUNTIME" = "1" ]; then
+        die "Tidak ada project Railway yang di-link. Dari dalam container, jalankan: railway link --project <nama-project> --environment <nama-environment> --service ${SERVICE_NAME}"
+    fi
     info "Membuat project Railway '${PROJECT_NAME}'..."
     if ! railway init --name "$PROJECT_NAME" --json >/tmp/railway-init.log 2>&1; then
         sed 's/^/    /' /tmp/railway-init.log >&2 || true

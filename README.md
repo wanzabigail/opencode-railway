@@ -55,6 +55,17 @@ Atau tentukan password sendiri:
 OPENCODE_SERVER_PASSWORD="$(openssl rand -hex 24)" ./deploy.sh
 ```
 
+> GitHub auto-deploy **tidak** menjalankan `deploy.sh`. Auto-deploy hanya
+> build image; volume `/data`, password, dan domain harus dibuat sekali dengan
+> `./deploy.sh` (atau lewat template Railway). Setelah volume terpasang,
+> redeploy dari GitHub akan tetap memakai data yang sama.
+
+> Saat `deploy.sh` dijalankan dari terminal container Railway, script
+> mengabaikan metadata `RAILWAY_*` runtime (project/environment/service milik
+> container itu) dan memakai project yang di-link. Kalau belum ada project
+> yang di-link, jalankan `railway link` dulu. Dengan begitu deploy tidak
+> nyasar ke service tempat script berjalan.
+
 Login non-interaktif (CI):
 
 ```bash
@@ -420,6 +431,7 @@ log container untuk password tersebut.
 | TCP proxy gagal dibuat | Pastikan Railway CLI terbaru (`railway upgrade --yes`). Satu service hanya boleh punya satu TCP proxy: `railway tcp-proxy list --service opencode-railway`. |
 | Session hilang setelah redeploy | Cek `railway volume list --json` dan `railway service list --json`. Pastikan volume ter-attach ke service **ini** dan `mountPath` persis `/data` (tanpa spasi). Perbaiki dengan `railway volume update --volume <nama> --mount-path /data`, lalu redeploy. Cek log: `railway logs \| grep -E 'Persistent data\|Session DB'`. Kalau ada peringatan `/data BUKAN mount point`, volume belum terpasang. |
 | Deploy berhenti dengan `Dibatalkan agar data lama tidak hilang` | `deploy.sh` menemukan service berjalan tanpa volume `/data` yang benar. Jalankan `MIGRATE_EXISTING_DATA=true ./deploy.sh` (tambahkan `MIGRATE_WORKSPACE=true` bila workspace ikut), atau `ALLOW_DATA_LOSS=true ./deploy.sh` bila data lama tidak diperlukan. |
+| Deploy mengubah service yang salah | `deploy.sh` versi lama mengikuti `RAILWAY_PROJECT_ID` runtime saat dijalankan dari dalam container. Versi terbaru mengabaikan metadata itu. Pastikan project benar dengan `railway link`, lalu jalankan ulang. |
 | Deploy gagal dengan `Pasang volume Railway di /data` | Ini disengaja: `start.sh` menolak berjalan tanpa volume agar data tidak hilang diam-diam. Jalankan `./deploy.sh` (yang memasang volume) atau tambahkan volume manual di dashboard Railway → service → **Volumes** → mount path `/data`, lalu redeploy. |
 | Volume ada tetapi data tetap hilang | Cek mount path di `railway volume list --json`. Mount path `/data ` (spasi di akhir) tidak sama dengan `/data`. Perbaiki: `railway volume update --volume <nama> --mount-path /data`, lalu redeploy. |
 | Healthcheck gagal | `GET /` harus 200. Cek `railway logs` untuk error startup. |

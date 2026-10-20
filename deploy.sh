@@ -23,6 +23,10 @@ info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mWARN:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
+if [ ! -f Dockerfile ] || [ ! -f railway.json ]; then
+    die "Jalankan dari root repo opencode-railway (Dockerfile & railway.json tidak ditemukan)."
+fi
+
 PROJECT_NAME="${PROJECT_NAME:-opencode-railway}"
 SERVICE_NAME="${SERVICE_NAME:-opencode-railway}"
 APP_PORT="${APP_PORT:-8080}"
@@ -90,6 +94,15 @@ if ! printf '%s' "$STATUS_JSON" | grep -Eq '"service"[[:space:]]*:[[:space:]]*\{
     fi
 fi
 
+# Volume dan domain selalu diarahkan ke service ini, bukan service lain yang
+# kebetulan sedang ter-link.
+info "Memilih service '${SERVICE_NAME}'..."
+if ! railway service link "$SERVICE_NAME" >/dev/null 2>&1; then
+    if ! railway link --service "$SERVICE_NAME" >/dev/null 2>&1; then
+        die "Gagal link ke service '${SERVICE_NAME}'. Jalankan 'railway service link ${SERVICE_NAME}' lalu ulangi."
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Variables
 # ---------------------------------------------------------------------------
@@ -99,10 +112,16 @@ else
     SETVAR_MODE="old"
 fi
 
+# Tunda deploy sampai semua variable selesai diset, lalu deploy sekali di akhir.
+SETVAR_FLAGS=()
+if railway variable set --help 2>&1 | grep -q -- '--skip-deploys'; then
+    SETVAR_FLAGS+=(--skip-deploys)
+fi
+
 set_var() {
     [ -n "${2:-}" ] || return 0
     if [ "$SETVAR_MODE" = "new" ]; then
-        railway variable set "$1=$2" >/dev/null
+        railway variable set "${SETVAR_FLAGS[@]}" "$1=$2" >/dev/null
     else
         railway variables --set "$1=$2" >/dev/null
     fi
@@ -137,29 +156,90 @@ done
 # ---------------------------------------------------------------------------
 # Volume persisten
 # ---------------------------------------------------------------------------
-info "Memastikan volume /data terpasang..."
-if ! railway volume add --mount-path /data >/dev/null 2>&1; then
-    warn "Volume /data tidak bisa dibuat otomatis (mungkin sudah ada)."
-    warn "Pastikan volume dengan mount path /data terpasang di dashboard Railway."
-fi
+volume_has_data_path() {
+    local json
+    json="$(railway volume list --json 2>/dev/null || true)"
+    if [ -n "$json" ]; then
+        printf '%s' "$json" \
+            | grep -Eq '"mountPath"[[:space:]]*:[[:space:]]*"/data"|"/data"' \
+            && return 0
+    fi
+    railway volume list 2>/dev/null | grep -q '/data' && return 0
+    return 1
+}
 
-# ---------------------------------------------------------------------------
-# Domain publik
-# ---------------------------------------------------------------------------
-info "Menyiapkan domain publik..."
-DOMAIN_OUT="$(railway domain --port "$APP_PORT" 2>&1 || true)"
-DOMAIN="$(printf '%s' "$DOMAIN_OUT" | grep -oE 'https?://[A-Za-z0-9._-]+' | sed -n '1p' || true)"
+ensure_volume() {
+    if volume_has_data_path; then
+        info "Volume /data sudah terpasang."
+        return 0
+    fi
 
-if [ -z "$DOMAIN" ]; then
-    DOMAIN_OUT="$(railway domain list --json 2>/dev/null || true)"
-    DOMAIN="$(printf '%s' "$DOMAIN_OUT" | grep -oE 'https?://[A-Za-z0-9._-]+' | sed -n '1p' || true)"
-fi
+    warn "Volume /data belum ada. Menambahkannya sekarang..."
+    warn "Kalau service ini sudah pernah jalan, isi /data lama akan tertutup volume baru."
+    if railway volume add --mount-path /data >/tmp/railway-volume.log 2>&1; then
+        info "Volume /data ditambahkan."
+        return 0
+    fi
+
+    # Kadang perintah add gagal karena volume sudah ada; cek ulang.
+    if volume_has_data_path; then
+        info "Volume /data sudah terpasang."
+        return 0
+    fi
+
+    warn "Gagal menambahkan volume /data:"
+    sed 's/^/    /' /tmp/railway-volume.log >&2 || true
+    warn "Tambahkan manual: service → Settings → Volumes → Add Volume → mount path /data"
+    return 1
+}
+
+info "Memastikan volume persisten..."
+ensure_volume || die "Volume /data wajib ada agar session & workspace tidak hilang saat redeploy."
 
 # ---------------------------------------------------------------------------
 # Deploy
 # ---------------------------------------------------------------------------
 info "Mendeploy (build Docker image di Railway)..."
 railway up --detach --message "deploy $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# ---------------------------------------------------------------------------
+# Domain publik (dibuat setelah service punya deployment)
+# ---------------------------------------------------------------------------
+DOMAIN=""
+
+extract_domain() {
+    sed -n 's/.*"domain"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+}
+
+ensure_domain() {
+    local json out
+    json="$(railway domain list --json --service "$SERVICE_NAME" 2>/dev/null || true)"
+    DOMAIN="$(printf '%s' "$json" | extract_domain)"
+    if [ -n "$DOMAIN" ]; then
+        info "Domain sudah ada: https://${DOMAIN}"
+        return 0
+    fi
+
+    info "Membuat domain publik (target port ${APP_PORT})..."
+    out="$(railway domain --port "$APP_PORT" --service "$SERVICE_NAME" 2>&1 || true)"
+    DOMAIN="$(printf '%s' "$out" | grep -oE '([A-Za-z0-9-]+\.)+up\.railway\.app' | head -n1 || true)"
+
+    if [ -z "$DOMAIN" ]; then
+        json="$(railway domain list --json --service "$SERVICE_NAME" 2>/dev/null || true)"
+        DOMAIN="$(printf '%s' "$json" | extract_domain)"
+    fi
+
+    if [ -n "$DOMAIN" ]; then
+        info "Domain: https://${DOMAIN}"
+        return 0
+    fi
+
+    warn "Domain belum terbentuk otomatis. Cek: railway domain list --service ${SERVICE_NAME}"
+    return 1
+}
+
+info "Menyiapkan domain publik..."
+ensure_domain || true
 
 # ---------------------------------------------------------------------------
 # Simpan kredensial lokal
@@ -171,12 +251,14 @@ cat > .deploy-credentials <<EOF
 OPENCODE_SERVER_PASSWORD=${OPENCODE_SERVER_PASSWORD}
 EOF
 
+URL="${DOMAIN:+https://${DOMAIN}}"
+
 cat <<EOF
 
 =============================================================================
 Deploy dikirim ke Railway.
 
-  URL      : ${DOMAIN:-<generate via: railway domain --port ${APP_PORT}>}
+  URL      : ${URL:-<generate via: railway domain --port ${APP_PORT} --service ${SERVICE_NAME}>}
   Password : ${OPENCODE_SERVER_PASSWORD}
 
 Password juga disimpan di ./.deploy-credentials (jangan di-commit).

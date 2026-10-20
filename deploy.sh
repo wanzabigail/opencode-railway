@@ -832,16 +832,24 @@ done
 HTTP_DOMAIN=""
 TCP_ADDRESS=""
 
+# Railway CLI 5.71 mengembalikan "domain": "https://..." untuk create,
+# sedangkan list mengembalikan hostname. Normalisasi ke hostname saja supaya
+# URL yang disimpan tidak menjadi "https://https://...".
+normalize_domain() {
+    sed -E 's#^[[:space:]]*https?://##; s#/+$##; s/[[:space:]]+$//'
+}
+
 # Ambil semua nilai field "domain" dari JSON Railway (aman untuk JSON
 # multi-baris maupun satu baris).
 domain_fields() {
     grep -oE '"domain"[[:space:]]*:[[:space:]]*"[^"]+"' \
-        | sed -E 's/^"domain"[[:space:]]*:[[:space:]]*"([^"]+)"$/\1/'
+        | sed -E 's/^"domain"[[:space:]]*:[[:space:]]*"([^"]+)"$/\1/' \
+        | normalize_domain
 }
 
 # Ambil domain dari output teks biasa (fallback CLI lama / bukan --json).
 domain_from_text() {
-    grep -oE '([A-Za-z0-9-]+\.)+up\.railway\.app' | head -n1 || true
+    grep -oE '([A-Za-z0-9-]+\.)+up\.railway\.app' | head -n1 | normalize_domain || true
 }
 
 # Ambil endpoint TCP proxy dari JSON atau teks.
@@ -913,6 +921,9 @@ ensure_http_networking() {
         text="$(railway domain list --service "$SERVICE_NAME" 2>/dev/null || true)"
         HTTP_DOMAIN="$(printf '%s' "$text" | domain_from_text)"
     fi
+
+    # Pastikan semua sumber (create/list/teks) menghasilkan hostname saja.
+    HTTP_DOMAIN="$(printf '%s' "$HTTP_DOMAIN" | normalize_domain)"
 
     if [ -n "$HTTP_DOMAIN" ]; then
         info "Domain HTTP: https://${HTTP_DOMAIN}"

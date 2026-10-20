@@ -3,7 +3,7 @@
 # start.sh — entrypoint container OpenCode di Railway
 #
 # 1. Siapkan direktori persisten (/data)
-# 2. Pastikan OPENCODE_SERVER_PASSWORD ada
+# 2. Pastikan OPENCODE_SERVER_PASSWORD ada (env / file persisten / generate)
 # 3. Jalankan `opencode serve` (foreground, PID 1 via tini) dengan supervisor:
 #    kalau server mati -> restart; kalau ada versi baru -> upgrade & restart
 #
@@ -39,14 +39,47 @@ mkdir -p /data/workspace "$HOME" \
 
 # ---------------------------------------------------------------------------
 # 2. Password server
+#
+# Urutan sumber password:
+#   1. OPENCODE_SERVER_PASSWORD dari environment (variable Railway)
+#   2. file di volume (password yang pernah digenerate)
+#   3. generate baru, lalu simpan ke volume
+#
+# Dengan begitu password tetap sama setelah restart/redeploy walau variable
+# Railway tidak diset (mis. deploy langsung dari dashboard).
 # ---------------------------------------------------------------------------
-if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
-    OPENCODE_SERVER_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-32)"
-    export OPENCODE_SERVER_PASSWORD
-    warn "OPENCODE_SERVER_PASSWORD tidak diset. Password acak dibuat:"
-    warn "  ${OPENCODE_SERVER_PASSWORD}"
-    warn "Set variabel ini di Railway agar password tidak berubah tiap restart."
+PASSWORD_FILE="${OPENCODE_PASSWORD_FILE:-$HOME/.opencode-server-password}"
+PASSWORD_SOURCE="environment"
+
+mkdir -p "$(dirname "$PASSWORD_FILE")" 2>/dev/null || true
+
+generate_password() {
+    local length="${1:-32}" password=""
+    while [ "${#password}" -lt "$length" ]; do
+        password="${password}$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+    done
+    printf '%s' "${password:0:$length}"
+}
+
+if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ] && [ -s "$PASSWORD_FILE" ]; then
+    OPENCODE_SERVER_PASSWORD="$(cat "$PASSWORD_FILE" 2>/dev/null || true)"
+    if [ -n "$OPENCODE_SERVER_PASSWORD" ]; then
+        PASSWORD_SOURCE="file ${PASSWORD_FILE}"
+    fi
 fi
+
+if [ -z "${OPENCODE_SERVER_PASSWORD:-}" ]; then
+    OPENCODE_SERVER_PASSWORD="$(generate_password 32)"
+    PASSWORD_SOURCE="generated"
+    if ( umask 077 && printf '%s\n' "$OPENCODE_SERVER_PASSWORD" > "$PASSWORD_FILE" ); then
+        PASSWORD_SOURCE="generated, disimpan di ${PASSWORD_FILE}"
+    else
+        warn "Password acak dibuat, tetapi gagal disimpan ke ${PASSWORD_FILE}."
+        warn "Password akan berubah saat container restart."
+    fi
+fi
+
+export OPENCODE_SERVER_PASSWORD
 
 # ---------------------------------------------------------------------------
 # 3. Profil hemat RAM/CPU
@@ -169,7 +202,10 @@ log "Working directory: $(pwd)"
 if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
     log "Public URL : https://${RAILWAY_PUBLIC_DOMAIN}"
 fi
-log "Login password: ${OPENCODE_SERVER_PASSWORD}"
+if [ -n "${RAILWAY_TCP_PROXY_DOMAIN:-}" ] && [ -n "${RAILWAY_TCP_PROXY_PORT:-}" ]; then
+    log "TCP URL    : ${RAILWAY_TCP_PROXY_DOMAIN}:${RAILWAY_TCP_PROXY_PORT}"
+fi
+log "Login password: ${OPENCODE_SERVER_PASSWORD} (${PASSWORD_SOURCE})"
 if [ "$AUTO_UPDATE" = true ]; then
     log "Auto-update: aktif (interval ${UPDATE_INTERVAL}s)"
 else

@@ -2,7 +2,7 @@
 # =============================================================================
 # start.sh — entrypoint container OpenCode di Railway
 #
-# 1. Siapkan direktori persisten (/data)
+# 1. Siapkan environment, verifikasi /data ter-mount, siapkan direktori
 # 2. Pastikan OPENCODE_SERVER_PASSWORD ada (env / file persisten / generate)
 # 3. Jalankan `opencode serve` (foreground, PID 1 via tini) dengan supervisor:
 #    kalau server mati -> restart; kalau ada versi baru -> upgrade & restart
@@ -34,11 +34,99 @@ export XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 # Biarkan supervisor kita yang menangani update, bukan updater internal.
 export OPENCODE_DISABLE_AUTOUPDATE="${OPENCODE_DISABLE_AUTOUPDATE:-true}"
 
-mkdir -p /data/workspace "$HOME" \
+# ---------------------------------------------------------------------------
+# 2. Pastikan /data benar-benar volume persisten
+#
+# Kalau volume tidak ter-mount, semua tulisan ke /data hanya masuk ke
+# filesystem container dan hilang saat redeploy. Lebih baik gagal dengan jelas
+# daripada kehilangan session tanpa peringatan.
+# ---------------------------------------------------------------------------
+MOUNTS_FILE="${OPENCODE_MOUNTS_FILE:-/proc/mounts}"
+
+data_is_mount_point() {
+    [ -r "$MOUNTS_FILE" ] || return 1
+    awk -v target=/data '$2 == target { found = 1 } END { exit found ? 0 : 1 }' "$MOUNTS_FILE"
+}
+
+DATA_IS_MOUNT=0
+if data_is_mount_point; then
+    DATA_IS_MOUNT=1
+fi
+
+# Kadang mount baru muncul beberapa saat setelah entrypoint mulai.
+if [ "$DATA_IS_MOUNT" -eq 0 ] && [ -n "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]; then
+    tries=0
+    while [ "$tries" -lt 10 ] && ! data_is_mount_point; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+    if data_is_mount_point; then
+        DATA_IS_MOUNT=1
+    fi
+fi
+
+if [ -n "${RAILWAY_VOLUME_MOUNT_PATH:-}" ]; then
+    log "Railway volume : ${RAILWAY_VOLUME_NAME:-<tanpa nama>} di '${RAILWAY_VOLUME_MOUNT_PATH}'"
+fi
+
+if [ "$DATA_IS_MOUNT" -eq 1 ]; then
+    log "Persistent data: /data ter-mount."
+else
+    warn "/data BUKAN mount point terpisah."
+    warn "Session, config, dan workspace akan hilang saat container di-redeploy."
+    if [ -n "${RAILWAY_ENVIRONMENT:-}" ] || [ -n "${RAILWAY_PROJECT_ID:-}" ]; then
+        case "${ALLOW_EPHEMERAL_DATA:-false}" in
+            1|true|yes|on)
+                warn "ALLOW_EPHEMERAL_DATA aktif; melanjutkan dengan /data ephemeral."
+                ;;
+            *)
+                die "Pasang volume Railway di /data (tanpa spasi) lalu redeploy. Set ALLOW_EPHEMERAL_DATA=true hanya untuk uji sementara."
+                ;;
+        esac
+    else
+        warn "Di luar Railway, jalankan container dengan -v <host>:/data agar data persisten."
+    fi
+fi
+
+# Lokasi database session dibuat eksplisit dan diikat ke HOME (yang berada di
+# volume), bukan ke XDG_DATA_HOME yang bisa di-inject platform. Default OpenCode
+# adalah ~/.local/share/opencode/opencode.db.
+export OPENCODE_DB="${OPENCODE_DB:-$HOME/.local/share/opencode/opencode.db}"
+DB_DIR="$(dirname "$OPENCODE_DB")"
+
+case "$HOME" in
+    /data|/data/*) ;;
+    *)
+        if [ -n "${RAILWAY_ENVIRONMENT:-}" ] || [ -n "${RAILWAY_PROJECT_ID:-}" ]; then
+            warn "HOME berada di luar /data (${HOME}); config/password bisa hilang saat redeploy."
+        fi
+        ;;
+esac
+case "$OPENCODE_DB" in
+    /data|/data/*) ;;
+    *)
+        if [ -n "${RAILWAY_ENVIRONMENT:-}" ] || [ -n "${RAILWAY_PROJECT_ID:-}" ]; then
+            warn "OPENCODE_DB berada di luar /data (${OPENCODE_DB}); session tidak akan persisten."
+        fi
+        ;;
+esac
+
+# XDG bisa di-inject platform. Kalau di luar /data, sebagian state OpenCode
+# (config/auth/service) tidak ikut volume.
+if [ -n "${RAILWAY_ENVIRONMENT:-}" ] || [ -n "${RAILWAY_PROJECT_ID:-}" ]; then
+    for xdg_var in XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME; do
+        case "${!xdg_var}" in
+            /data|/data/*) ;;
+            *) warn "${xdg_var} berada di luar /data (${!xdg_var}); state OpenCode bisa hilang saat redeploy." ;;
+        esac
+    done
+fi
+
+mkdir -p /data/workspace "$HOME" "$DB_DIR" \
     "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"
 
 # ---------------------------------------------------------------------------
-# 2. Password server
+# 3. Password server
 #
 # Urutan sumber password:
 #   1. OPENCODE_SERVER_PASSWORD dari environment (variable Railway)
@@ -82,7 +170,7 @@ fi
 export OPENCODE_SERVER_PASSWORD
 
 # ---------------------------------------------------------------------------
-# 3. Profil hemat RAM/CPU
+# 4. Profil hemat RAM/CPU
 #
 # Menyalakan flag yang mematikan pekerjaan latar belakang (file watcher,
 # fetch daftar model, pemindaian Claude Code) dan memasang config OpenCode
@@ -125,7 +213,7 @@ apply_low_resource() {
 apply_low_resource
 
 # ---------------------------------------------------------------------------
-# 4. Konfigurasi auto-update
+# 5. Konfigurasi auto-update
 # ---------------------------------------------------------------------------
 AUTO_UPDATE="${OPENCODE_AUTO_UPDATE:-true}"
 case "$AUTO_UPDATE" in
@@ -140,7 +228,7 @@ esac
 [ "$UPDATE_INTERVAL" -ge 300 ] 2>/dev/null || UPDATE_INTERVAL=300
 
 # ---------------------------------------------------------------------------
-# 5. Supervisor
+# 6. Supervisor
 # ---------------------------------------------------------------------------
 SHUTDOWN=0
 SERVER_PID=""
@@ -198,7 +286,15 @@ updater_loop() {
 
 cd /data/workspace
 
+if [ "$DATA_IS_MOUNT" -eq 1 ]; then
+    PERSISTENT_LABEL="volume /data"
+else
+    PERSISTENT_LABEL="EPHEMERAL (tanpa volume)"
+fi
+
 log "Working directory: $(pwd)"
+log "Session DB : ${OPENCODE_DB}"
+log "Persistent : ${PERSISTENT_LABEL}"
 if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
     log "Public URL : https://${RAILWAY_PUBLIC_DOMAIN}"
 fi

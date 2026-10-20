@@ -6,21 +6,23 @@ server selalu-aktif, lengkap dengan web UI, API, dan workspace persisten.
 ```
 Internet ──HTTPS──> Railway edge ──> opencode serve 0.0.0.0:$PORT
                                           │
-                                   volume /data
+                                   volume /data (wajib ter-mount)
                                    ├── workspace/   (repo & hasil kerja)
-                                   └── home/        (config, session, credential,
-                                                     password auto-generate)
+                                   └── home/        (config, credential, password,
+                                                     .local/share/opencode/opencode.db
+                                                     → session & message)
 ```
 
-**Otomatis:** password kuat (sekali generate, disimpan persisten) dan public
-networking HTTP/TCP (domain Railway dan/atau TCP proxy).
+**Otomatis:** password kuat (sekali generate, disimpan persisten), public
+networking HTTP/TCP (domain Railway dan/atau TCP proxy), dan volume `/data`
+yang benar-benar ter-mount agar session bertahan saat redeploy.
 
 ## Isi repo
 
 | File | Fungsi |
 | --- | --- |
 | `Dockerfile` | Image Node 24 + `@opencode/cli@latest` + tini + git/curl/ssh/rg |
-| `start.sh` | Entrypoint: siapkan `/data`, password persisten, jalankan `opencode serve` |
+| `start.sh` | Entrypoint: verifikasi `/data` ter-mount, siapkan DB & password, jalankan `opencode serve` |
 | `railway.json` | Konfigurasi build & healthcheck Railway |
 | `deploy.sh` | Deploy otomatis: project, service, variable, volume, domain HTTP/TCP |
 | `push-github.sh` | Commit + buat repo GitHub + push (gh atau `GITHUB_TOKEN`) |
@@ -63,11 +65,22 @@ RAILWAY_TOKEN=... ./deploy.sh
 
 1. install Railway CLI bila belum ada,
 2. `railway init` bila project belum ter-link,
-3. membuat/link service dan menyetel variable (`PORT`, password, API key),
-4. memverifikasi/memasang volume `/data`,
-5. membuat public networking: domain HTTP dan/atau TCP proxy,
-6. `railway up`, lalu mencoba ulang networking bila deployment baru siap,
-7. menyimpan password + URL ke `.deploy-credentials`.
+3. membuat/link service,
+4. memastikan volume `/data` ter-scope ke service ini: memakai ulang volume
+   detached, memperbaiki mount path yang salah (termasuk `/data ` dengan spasi
+   di akhir), atau membuat volume baru bila belum ada,
+5. memverifikasi volume benar-benar ter-attach dan mount path-nya persis
+   `/data`,
+6. menyetel variable (`PORT`, password, API key) — setelah volume siap agar
+   redeploy yang dipicu variable tidak mendahului migrasi data,
+7. membuat public networking: domain HTTP dan/atau TCP proxy,
+8. `railway up`, lalu mencoba ulang networking bila deployment baru siap,
+9. menyimpan password + URL ke `.deploy-credentials`.
+
+Kalau service sudah berjalan tanpa volume yang benar, `deploy.sh` berhenti
+lebih dulu agar session/workspace lama tidak hilang. Jalankan dengan
+`MIGRATE_EXISTING_DATA=true` untuk migrasi otomatis, atau `ALLOW_DATA_LOSS=true`
+bila data lama memang tidak diperlukan.
 
 ## Password otomatis
 
@@ -90,6 +103,118 @@ railway logs | grep 'Login password'
 ```
 
 > Jangan membagikan log container karena berisi password.
+
+## Session & data persisten
+
+OpenCode V2 menyimpan session, message, project, config, dan credential di
+`$HOME` (`/data/home`). Supaya semuanya bertahan saat redeploy, `/data` **harus**
+benar-benar volume Railway, bukan direktori biasa di filesystem container.
+
+`deploy.sh` melakukan ini sebelum deploy:
+
+1. Membaca service ID dan men-scope pengecekan volume ke service ini.
+   `railway volume list` berlaku untuk seluruh environment, jadi volume milik
+   service lain tidak boleh dianggap sebagai volume service ini.
+2. Memakai ulang volume detached yang mount path-nya `/data` (mis. sisa
+   deployment lama).
+3. Memperbaiki mount path yang salah, termasuk kasus yang pernah terjadi di
+   Railway: mount path tersimpan sebagai `/data ` (ada spasi di akhir).
+   Volume seperti ini tidak ter-mount ke `/data`, sehingga data tetap ephemeral.
+4. Membuat volume baru bila service belum punya volume.
+5. Memverifikasi volume benar-benar ter-attach ke service dan mount path-nya
+   persis `/data`.
+
+`start.sh` memverifikasi `/proc/mounts` saat container start:
+
+- Kalau `/data` ter-mount: log `Persistent data: /data ter-mount.`
+- Di Railway, kalau `/data` bukan mount point, container **berhenti** dengan
+  error. Ini disengaja agar session tidak hilang diam-diam. Untuk uji
+  sementara, set `ALLOW_EPHEMERAL_DATA=true` (data akan hilang saat redeploy).
+- Lokasi DB dibuat eksplisit lewat `OPENCODE_DB`, default
+  `/data/home/.local/share/opencode/opencode.db`, dan dicatat di log
+  (`Session DB: ...`).
+
+> Kalau service terhubung ke **auto-deploy GitHub**, tunda push/merge sampai
+> volume `/data` sudah dibuat dan migrasi selesai. Kalau tidak, deploy otomatis
+> akan menjalankan `start.sh` baru tanpa volume dan service sengaja berhenti.
+
+### Volume pertama kali & data lama
+
+Kalau service sudah pernah berjalan **tanpa volume** (atau volume ter-mount di
+path yang salah), isi `/data` lama berada di filesystem ephemeral. Saat volume
+dipasang/diperbaiki, isi tersebut akan tertutup. `deploy.sh` mendeteksi kondisi
+ini dan **berhenti** sebelum mengubah volume, kecuali Anda memilih salah satu:
+
+**Opsi 1 — migrasi otomatis (disarankan):**
+
+```bash
+MIGRATE_EXISTING_DATA=true ./deploy.sh
+```
+
+> `.env` dimuat setelah environment shell. Kalau `.env` Anda memuat
+> `MIGRATE_EXISTING_DATA=false` (atau `ALLOW_DATA_LOSS=false`), hapus/ubah baris
+> itu dulu karena nilainya akan menimpa flag di command line.
+
+`deploy.sh` akan:
+
+1. download `/data/home` dari deployment yang sedang berjalan ke
+   `./.deploy-backup/recovery-<timestamp>/home`,
+2. (opsional) download `/data/workspace` bila `MIGRATE_WORKSPACE=true`,
+3. membuat/melampirkan/memperbaiki volume `/data`,
+4. upload backup ke volume:
+   - volume baru/kosong → `home` menjadi `/data/home` dan `workspace` menjadi
+     `/data/workspace`;
+   - volume yang sudah berisi data → backup disimpan di
+     `/recovery-<timestamp>/home` agar session lama di volume tidak tertimpa,
+5. baru melakukan redeploy.
+
+Kalau salah satu langkah gagal, redeploy dibatalkan dan data lama tetap aman
+(baik di service maupun di `.deploy-backup/`).
+
+> Untuk volume yang sudah berisi data, server akan memakai database lama di
+> volume. Session dari `/data` ephemeral tidak otomatis dimuat; salinannya ada
+> di `/recovery-<timestamp>/home` di volume dan di `.deploy-backup/` lokal untuk
+> digabung manual.
+
+**Opsi 2 — backup manual:**
+
+Untuk volume **baru/kosong**:
+
+```bash
+railway service files --service opencode-railway download /data/home ./.deploy-backup/home --overwrite
+railway service files --service opencode-railway download /data/workspace ./.deploy-backup/workspace --overwrite
+
+# setelah volume terpasang
+railway volume files --volume <volume-id> upload ./.deploy-backup/home / --overwrite
+railway volume files --volume <volume-id> upload ./.deploy-backup/workspace / --overwrite
+```
+
+`/` di sini adalah root volume, jadi `home` masuk ke `/data/home` dan
+`workspace` masuk ke `/data/workspace`.
+
+Kalau volume **sudah berisi data**, bungkus backup dalam folder recovery agar
+database lama tidak tertimpa:
+
+```bash
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p ".deploy-backup/recovery-$stamp"
+railway service files --service opencode-railway download /data/home ".deploy-backup/recovery-$stamp/home" --overwrite
+railway service files --service opencode-railway download /data/workspace ".deploy-backup/recovery-$stamp/workspace" --overwrite
+
+railway volume files --volume <volume-id> upload ".deploy-backup/recovery-$stamp" / --overwrite
+```
+
+Hasilnya ada di `/recovery-<timestamp>/home` di volume. Command `service files`
+dan `volume files` memerlukan Railway CLI terbaru.
+
+**Opsi 3 — data lama tidak diperlukan:**
+
+```bash
+ALLOW_DATA_LOSS=true ./deploy.sh
+```
+
+> Backup DB yang sedang dipakai server bersifat best-effort. Hentikan aktivitas
+> agent dulu agar konsisten. `.deploy-backup/` di-ignore git.
 
 ## Public networking otomatis
 
@@ -192,7 +317,12 @@ pemakaian normal, gunakan domain HTTP.
 | `OPENCODE_AUTO_UPDATE` | tidak | `true` | Supervisor cek & pasang versi npm terbaru |
 | `OPENCODE_AUTO_UPDATE_INTERVAL` | tidak | `21600` | Interval cek update (detik, min. 300) |
 | `OPENCODE_LOW_RESOURCE` | tidak | `true` | Profil hemat RAM/CPU |
-| `OPENCODE_HOME` | tidak | `/data/home` | Lokasi state/config (di volume) |
+| `OPENCODE_HOME` | tidak | `/data/home` | Lokasi state/config (harus di volume) |
+| `OPENCODE_DB` | tidak | `/data/home/.local/share/opencode/opencode.db` | Lokasi database session/message |
+| `ALLOW_EPHEMERAL_DATA` | tidak | `false` | Izinkan start di Railway tanpa volume `/data` (data tidak persisten; hanya untuk uji) |
+| `MIGRATE_EXISTING_DATA` | tidak | `false` | Khusus `deploy.sh`: backup `/data/home` dari deployment lama lalu upload ke volume (volume baru) atau folder recovery (volume yang sudah berisi data) |
+| `MIGRATE_WORKSPACE` | tidak | `false` | Khusus `deploy.sh`: ikut migrasikan `/data/workspace` |
+| `ALLOW_DATA_LOSS` | tidak | `false` | Khusus `deploy.sh`: lanjutkan tanpa migrasi walau data ephemeral lama akan hilang |
 | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GROQ_API_KEY`, `OPENCODE_API_KEY` | tidak | – | Kredensial provider model |
 | `OPENAI_BASE_URL`, `DEEPSEEK_BASE_URL`, `OPENROUTER_BASE_URL` | tidak | – | Endpoint OpenAI-compatible |
 
@@ -288,7 +418,10 @@ log container untuk password tersebut.
 | Lupa password auto-generate | `railway logs \| grep 'Login password'`, atau baca file di volume. Hapus file untuk generate ulang. |
 | Domain HTTP tidak terbentuk | `railway domain --port 8080 --service opencode-railway`, lalu cek `railway domain list`. |
 | TCP proxy gagal dibuat | Pastikan Railway CLI terbaru (`railway upgrade --yes`). Satu service hanya boleh punya satu TCP proxy: `railway tcp-proxy list --service opencode-railway`. |
-| Session hilang setelah redeploy | Pastikan volume ter-mount di `/data`. |
+| Session hilang setelah redeploy | Cek `railway volume list --json` dan `railway service list --json`. Pastikan volume ter-attach ke service **ini** dan `mountPath` persis `/data` (tanpa spasi). Perbaiki dengan `railway volume update --volume <nama> --mount-path /data`, lalu redeploy. Cek log: `railway logs \| grep -E 'Persistent data\|Session DB'`. Kalau ada peringatan `/data BUKAN mount point`, volume belum terpasang. |
+| Deploy berhenti dengan `Dibatalkan agar data lama tidak hilang` | `deploy.sh` menemukan service berjalan tanpa volume `/data` yang benar. Jalankan `MIGRATE_EXISTING_DATA=true ./deploy.sh` (tambahkan `MIGRATE_WORKSPACE=true` bila workspace ikut), atau `ALLOW_DATA_LOSS=true ./deploy.sh` bila data lama tidak diperlukan. |
+| Deploy gagal dengan `Pasang volume Railway di /data` | Ini disengaja: `start.sh` menolak berjalan tanpa volume agar data tidak hilang diam-diam. Jalankan `./deploy.sh` (yang memasang volume) atau tambahkan volume manual di dashboard Railway → service → **Volumes** → mount path `/data`, lalu redeploy. |
+| Volume ada tetapi data tetap hilang | Cek mount path di `railway volume list --json`. Mount path `/data ` (spasi di akhir) tidak sama dengan `/data`. Perbaiki: `railway volume update --volume <nama> --mount-path /data`, lalu redeploy. |
 | Healthcheck gagal | `GET /` harus 200. Cek `railway logs` untuk error startup. |
 | Model tidak muncul | Set API key provider sebagai variable Railway, lalu redeploy. |
 

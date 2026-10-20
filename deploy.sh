@@ -12,6 +12,9 @@
 #   APP_PORT=8080
 #   PUBLIC_NETWORKING=http|tcp|both|none   (default: http)
 #   TCP_PROXY_PORT=8080                    (default: APP_PORT)
+#   MIGRATE_EXISTING_DATA=true             (backup /data lama sebelum volume diubah)
+#   MIGRATE_WORKSPACE=true                 (ikut migrasikan /data/workspace)
+#   ALLOW_DATA_LOSS=true                   (skip migrasi; data ephemeral lama hilang)
 #   ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY / ... (opsional)
 #
 # Login non-interaktif:
@@ -211,7 +214,560 @@ if [ "${#OPENCODE_SERVER_PASSWORD}" -lt 16 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Volume persisten
+#
+# `railway volume list` berlaku untuk seluruh environment, bukan hanya service
+# yang sedang di-link. Pengecekan lama yang hanya mencari string "/data" bisa
+# false-positive karena volume milik service lain. Semua pengecekan di sini
+# di-scope ke SERVICE_NAME, dan mount path harus persis "/data" tanpa spasi.
+# ---------------------------------------------------------------------------
+SERVICE_ID=""
+SERVICE_DEPLOYMENT_ID=""
+VOLUME_ID=""
+VOLUME_NAME=""
+VOLUME_MOUNT_RAW=""
+VOLUME_SERVICE=""
+VOLUME_STATUS=""
+VOLUME_PENDING=""
+VOLUME_CHANGED=0
+VOLUME_CREATED=0
+MIGRATION_BACKUP_DIR=""
+MIGRATE_EXISTING_DATA="${MIGRATE_EXISTING_DATA:-false}"
+MIGRATE_WORKSPACE="${MIGRATE_WORKSPACE:-false}"
+ALLOW_DATA_LOSS="${ALLOW_DATA_LOSS:-false}"
+
+resolve_service_id() {
+    local json id deployment_id
+    if [ -n "$SERVICE_ID" ]; then
+        return 0
+    fi
+
+    # Untuk service yang sudah punya deployment, ini paling sederhana.
+    json="$(railway service status --json 2>/dev/null || true)"
+    if [ -n "$json" ]; then
+        id="$(printf '%s' "$json" \
+            | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | head -n1 \
+            | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+        deployment_id="$(printf '%s' "$json" \
+            | grep -oE '"deploymentId"[[:space:]]*:[[:space:]]*"[^"]+"' \
+            | head -n1 \
+            | sed -E 's/.*"([^"]+)"$/\1/' || true)"
+        if [ -n "$deployment_id" ] && [ "$deployment_id" != "null" ]; then
+            SERVICE_DEPLOYMENT_ID="$deployment_id"
+        fi
+        if [ -n "$id" ]; then
+            SERVICE_ID="$id"
+            return 0
+        fi
+    fi
+
+    # Fallback: `railway service list --json` (array of services).
+    json="$(railway service list --json 2>/dev/null || true)"
+    if [ -n "$json" ]; then
+        if command -v node >/dev/null 2>&1; then
+            id="$(printf '%s' "$json" | node -e '
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  let data;
+  try { data = JSON.parse(input); } catch { process.exit(2); }
+  const name = process.argv[1];
+  const rows = Array.isArray(data) ? data : (data.services || []);
+  const service = rows.find((row) => row.name === name);
+  if (!service || !service.id) process.exit(1);
+  process.stdout.write(service.id);
+});
+' "$SERVICE_NAME" 2>/dev/null || true)"
+        elif command -v python3 >/dev/null 2>&1; then
+            id="$(printf '%s' "$json" | python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+
+name = sys.argv[1]
+rows = data if isinstance(data, list) else data.get("services", [])
+service = next((row for row in rows if row.get("name") == name), None)
+if not service or not service.get("id"):
+    sys.exit(1)
+sys.stdout.write(service["id"])
+' "$SERVICE_NAME" 2>/dev/null || true)"
+        fi
+    fi
+
+    [ -n "$id" ] || return 1
+    SERVICE_ID="$id"
+}
+
+# Perintah volume selalu memakai service ini. Kalau service ID tidak terbaca,
+# perintah tetap jalan memakai service yang sedang ter-link.
+volume_cmd() {
+    local subcommand="$1"
+    shift
+    if [ -n "$SERVICE_ID" ]; then
+        # --service adalah opsi parent, harus sebelum subcommand.
+        railway volume --service "$SERVICE_ID" "$subcommand" "$@"
+    else
+        railway volume "$subcommand" "$@"
+    fi
+}
+
+strip_ansi() {
+    sed $'s/\033\\[[0-9;]*[A-Za-z]//g'
+}
+
+normalize_mount_path() {
+    printf '%s' "${1:-}" \
+        | tr -d '\r' \
+        | sed -E 's/[[:space:]]+$//'
+}
+
+# Output baris TSV dengan pemisah unit separator (0x1f):
+#   id, name, mountPath, serviceName, status, isPendingDeletion
+volume_rows() {
+    local json
+    json="$(railway volume list --json 2>/dev/null || true)"
+    if [ -n "$json" ]; then
+        if command -v node >/dev/null 2>&1; then
+            if printf '%s' "$json" | node -e '
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", () => {
+  let data;
+  try { data = JSON.parse(input); } catch { process.exit(2); }
+  const volumes = Array.isArray(data) ? data : (data.volumes || []);
+  const clean = (value) => String(value ?? "").replace(/[\t\r\n\u001f]+/g, " ");
+  for (const volume of volumes) {
+    console.log([
+      volume.id,
+      volume.name,
+      volume.mountPath,
+      volume.serviceName,
+      volume.status,
+      volume.isPendingDeletion,
+    ].map(clean).join("\u001f"));
+  }
+});
+'; then
+                return 0
+            fi
+        elif command -v python3 >/dev/null 2>&1; then
+            if printf '%s' "$json" | python3 -c '
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(2)
+
+volumes = data if isinstance(data, list) else data.get("volumes", [])
+for volume in volumes:
+    values = [
+        volume.get("id", ""),
+        volume.get("name", ""),
+        volume.get("mountPath", ""),
+        volume.get("serviceName", ""),
+        volume.get("status", ""),
+        volume.get("isPendingDeletion", ""),
+    ]
+    cleaned = []
+    for value in values:
+        if value is None:
+            text = ""
+        elif isinstance(value, bool):
+            text = "true" if value else "false"
+        else:
+            text = str(value)
+        for char in ("\t", "\r", "\n", "\x1f"):
+            text = text.replace(char, " ")
+        cleaned.append(text)
+    print("\x1f".join(cleaned))
+'; then
+                return 0
+            fi
+        fi
+    fi
+
+    # Fallback untuk CLI lama / tanpa Node/Python: parse output teks.
+    railway volume list 2>/dev/null \
+        | strip_ansi \
+        | awk '
+            function emit() {
+                if (name != "") {
+                    printf "%s\037%s\037%s\037%s\037%s\037%s\n", name, name, mount, service, status, "false"
+                }
+            }
+            /^Volume:[[:space:]]*/ {
+                emit()
+                name = $0
+                sub(/^Volume:[[:space:]]*/, "", name)
+                service = ""
+                mount = ""
+                status = ""
+                next
+            }
+            /^Attached to:[[:space:]]*/ {
+                service = $0
+                sub(/^Attached to:[[:space:]]*/, "", service)
+                if (service == "N/A") service = ""
+                next
+            }
+            /^Mount path:[[:space:]]*/ {
+                mount = $0
+                sub(/^Mount path:[[:space:]]*/, "", mount)
+                next
+            }
+            /^Status:[[:space:]]*/ {
+                status = $0
+                sub(/^Status:[[:space:]]*/, "", status)
+                next
+            }
+            END { emit() }
+        '
+}
+
+read_volume_row() {
+    IFS=$'\037' read -r VOLUME_ID VOLUME_NAME VOLUME_MOUNT_RAW \
+        VOLUME_SERVICE VOLUME_STATUS VOLUME_PENDING <<< "$1"
+}
+
+refresh_attached_volume() {
+    local rows row
+    rows="$(volume_rows | awk -F '\037' -v service="$SERVICE_NAME" '
+        $4 == service && tolower($6) != "true" && tolower($5) !~ /^(deleting|deleted)$/ { print }
+    ')"
+    [ -n "$rows" ] || return 1
+
+    # Utamakan volume yang sudah tepat di /data. Kalau tidak ada, volume dengan
+    # mount path /data + spasi (yang bisa diperbaiki) lebih dipilih daripada
+    # volume lain milik service yang sama.
+    row="$(printf '%s\n' "$rows" | awk -F '\037' '$3 == "/data" { print; exit }')"
+    if [ -z "$row" ]; then
+        row="$(printf '%s\n' "$rows" | awk -F '\037' '
+            { mount = $3; sub(/[[:space:]]+$/, "", mount) }
+            mount == "/data" { print; exit }
+        ')"
+    fi
+    if [ -z "$row" ]; then
+        row="$(printf '%s\n' "$rows" | head -n1)"
+    fi
+
+    [ -n "$row" ] || return 1
+    read_volume_row "$row"
+    return 0
+}
+
+detached_volume_rows() {
+    volume_rows | awk -F '\037' '
+        ($4 == "" || $4 == "N/A") && tolower($6) != "true" && tolower($5) !~ /^(deleting|deleted)$/ {
+            mount = $3
+            sub(/[[:space:]]+$/, "", mount)
+            if (mount == "/data") print
+        }
+    '
+}
+
+wait_for_attached_volume() {
+    local tries=0
+    while [ "$tries" -lt 15 ]; do
+        if refresh_attached_volume; then
+            return 0
+        fi
+        sleep 2
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+wait_for_exact_mount_path() {
+    local tries=0
+    while [ "$tries" -lt 15 ]; do
+        if refresh_attached_volume && [ "$VOLUME_MOUNT_RAW" = "/data" ]; then
+            return 0
+        fi
+        sleep 2
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
+ensure_volume_mount_path() {
+    local normalized
+    normalized="$(normalize_mount_path "$VOLUME_MOUNT_RAW")"
+
+    if [ "$VOLUME_MOUNT_RAW" = "/data" ]; then
+        return 0
+    fi
+
+    if [ "$normalized" = "/data" ]; then
+        warn "Mount path volume '${VOLUME_NAME}' berisi spasi di akhir ('${VOLUME_MOUNT_RAW}')."
+        warn "Railway akan me-mount volume di path yang salah; memperbaiki ke '/data'..."
+    else
+        warn "Mount path volume '${VOLUME_NAME}' adalah '${VOLUME_MOUNT_RAW}', bukan '/data'."
+        warn "Memindahkan mount path ke '/data' (isi volume dipertahankan)..."
+    fi
+
+    if ! volume_cmd update --volume "$VOLUME_ID" --mount-path /data >/tmp/railway-volume.log 2>&1; then
+        warn "Gagal memperbaiki mount path volume:"
+        sed 's/^/    /' /tmp/railway-volume.log >&2 || true
+        return 1
+    fi
+    VOLUME_CHANGED=1
+
+    if ! wait_for_exact_mount_path; then
+        warn "Mount path volume masih '${VOLUME_MOUNT_RAW}' setelah update."
+        return 1
+    fi
+    return 0
+}
+
+bool_true() {
+    case "${1:-false}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+backup_existing_data() {
+    local stamp dir
+    if ! railway service files --help >/dev/null 2>&1; then
+        warn "Railway CLI ini belum mendukung 'railway service files'."
+        warn "Upgrade CLI: railway upgrade --yes (atau npm i -g @railway/cli@latest)"
+        return 1
+    fi
+    if ! railway volume files --help >/dev/null 2>&1; then
+        warn "Railway CLI ini belum mendukung 'railway volume files'."
+        warn "Upgrade CLI: railway upgrade --yes (atau npm i -g @railway/cli@latest)"
+        return 1
+    fi
+
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    dir=".deploy-backup/recovery-${stamp}"
+    mkdir -p "$dir"
+
+    info "Menyimpan /data/home dari deployment yang sedang berjalan ke ${dir}/home..."
+    if ! railway service files --service "$SERVICE_NAME" download /data/home "$dir/home" --overwrite >/tmp/railway-backup.log 2>&1; then
+        warn "Gagal backup /data/home:"
+        sed 's/^/    /' /tmp/railway-backup.log >&2 || true
+        return 1
+    fi
+
+    if bool_true "$MIGRATE_WORKSPACE"; then
+        info "Menyimpan /data/workspace ke ${dir}/workspace..."
+        if ! railway service files --service "$SERVICE_NAME" download /data/workspace "$dir/workspace" --overwrite >>/tmp/railway-backup.log 2>&1; then
+            warn "Gagal backup /data/workspace:"
+            sed 's/^/    /' /tmp/railway-backup.log >&2 || true
+            return 1
+        fi
+    fi
+
+    MIGRATION_BACKUP_DIR="$dir"
+    info "Backup selesai: ${dir}"
+    return 0
+}
+
+preflight_existing_data() {
+    if [ -z "$SERVICE_DEPLOYMENT_ID" ]; then
+        return 0
+    fi
+
+    # Kalau volume sudah terpasang tepat di /data, tidak ada data yang akan
+    # tertutup oleh perubahan volume.
+    if refresh_attached_volume && [ "$VOLUME_MOUNT_RAW" = "/data" ]; then
+        return 0
+    fi
+
+    warn "Service '${SERVICE_NAME}' sedang berjalan tanpa volume /data yang benar."
+    warn "Membuat/melampirkan/memperbaiki volume akan menyembunyikan isi /data"
+    warn "yang sekarang (session, config, workspace)."
+
+    # Migrasi menang kalau kedua flag aktif: jangan buang data hanya karena
+    # ALLOW_DATA_LOSS juga ter-set di .env.
+    if bool_true "$MIGRATE_EXISTING_DATA"; then
+        info "MIGRATE_EXISTING_DATA aktif: backup otomatis sebelum volume diubah..."
+        if ! backup_existing_data; then
+            die "Backup otomatis gagal; volume belum diubah, data lama masih aman. Backup manual lalu ulangi."
+        fi
+        return 0
+    fi
+
+    if bool_true "$ALLOW_DATA_LOSS"; then
+        warn "ALLOW_DATA_LOSS aktif: isi /data lama tidak dipindahkan ke volume."
+        return 0
+    fi
+
+    warn "Backup manual:"
+    warn "  railway service files --service ${SERVICE_NAME} download /data/home ./.deploy-backup/home --overwrite"
+    warn "  railway service files --service ${SERVICE_NAME} download /data/workspace ./.deploy-backup/workspace --overwrite"
+    die "Dibatalkan agar data lama tidak hilang. Backup dulu, lalu jalankan lagi dengan MIGRATE_EXISTING_DATA=true. Kalau data lama tidak diperlukan: ALLOW_DATA_LOSS=true ./deploy.sh"
+}
+
+restore_migration_backup() {
+    [ -n "$MIGRATION_BACKUP_DIR" ] || return 0
+    if [ -z "$VOLUME_ID" ]; then
+        warn "Volume ID tidak diketahui; upload backup dilewati."
+        return 1
+    fi
+
+    if [ "$VOLUME_CREATED" -eq 1 ]; then
+        # Volume baru/kosong: isi backup menjadi state utama.
+        info "Mengunggah backup ke volume baru /data (${VOLUME_NAME:-$VOLUME_ID})..."
+        if ! railway volume files --volume "$VOLUME_ID" upload "$MIGRATION_BACKUP_DIR/home" / --overwrite >/tmp/railway-restore.log 2>&1; then
+            warn "Gagal upload backup home ke volume:"
+            sed 's/^/    /' /tmp/railway-restore.log >&2 || true
+            return 1
+        fi
+
+        if [ -d "$MIGRATION_BACKUP_DIR/workspace" ]; then
+            info "Mengunggah workspace ke volume..."
+            if ! railway volume files --volume "$VOLUME_ID" upload "$MIGRATION_BACKUP_DIR/workspace" / --overwrite >>/tmp/railway-restore.log 2>&1; then
+                warn "Gagal upload backup workspace ke volume:"
+                sed 's/^/    /' /tmp/railway-restore.log >&2 || true
+                return 1
+            fi
+        fi
+    else
+        # Volume sudah punya data. Jangan timpa database/session lama; simpan
+        # backup saat ini di folder terpisah agar bisa digabung manual.
+        info "Volume sudah berisi data; menyimpan backup saat ini ke /recovery-..."
+        if ! railway volume files --volume "$VOLUME_ID" upload "$MIGRATION_BACKUP_DIR" / --overwrite >/tmp/railway-restore.log 2>&1; then
+            warn "Gagal upload folder recovery ke volume:"
+            sed 's/^/    /' /tmp/railway-restore.log >&2 || true
+            return 1
+        fi
+        warn "Backup saat ini disimpan di volume pada /$(basename "$MIGRATION_BACKUP_DIR")/home"
+        warn "Volume tetap memakai data lamanya. Gabungkan manual bila perlu."
+    fi
+
+    info "Backup berhasil diunggah ke volume. Data lokal tetap ada di ${MIGRATION_BACKUP_DIR}."
+    return 0
+}
+
+ensure_volume() {
+    local row candidate="" ignored_detached=0
+
+    if ! preflight_existing_data; then
+        return 1
+    fi
+
+    if refresh_attached_volume; then
+        if ensure_volume_mount_path; then
+            info "Volume /data sudah terpasang di service '${SERVICE_NAME}' (${VOLUME_NAME})."
+            return 0
+        fi
+        warn "Volume ada tetapi mount path belum bisa diperbaiki otomatis."
+        warn "Perbaiki manual: railway volume update --volume ${VOLUME_ID:-$VOLUME_NAME} --mount-path /data"
+        return 1
+    fi
+
+    # Cari volume detached yang sudah di /data. Volume ini mungkin berisi data
+    # dari deployment sebelumnya, jadi lebih baik dipakai ulang daripada
+    # membuat volume kosong baru. Hanya volume yang namanya mengandung nama
+    # service ini yang dipakai otomatis, supaya volume milik service lain
+    # (volume list berlaku environment-wide) tidak ikut ter-attach.
+    while IFS= read -r row; do
+        [ -n "$row" ] || continue
+        read_volume_row "$row"
+        case "$(printf '%s' "$VOLUME_NAME" | tr '[:upper:]' '[:lower:]')" in
+            *"$(printf '%s' "$SERVICE_NAME" | tr '[:upper:]' '[:lower:]')"*)
+                candidate="$row"
+                break
+                ;;
+            *)
+                ignored_detached=$((ignored_detached + 1))
+                ;;
+        esac
+    done < <(detached_volume_rows)
+
+    if [ -n "$candidate" ]; then
+        read_volume_row "$candidate"
+        warn "Menemukan volume detached '${VOLUME_NAME}' di /data; melampirkan ke service '${SERVICE_NAME}'..."
+        if volume_cmd attach --volume "$VOLUME_ID" --yes >/tmp/railway-volume.log 2>&1; then
+            VOLUME_CHANGED=1
+            if wait_for_attached_volume && ensure_volume_mount_path; then
+                info "Volume /data berhasil dilampirkan (${VOLUME_NAME})."
+                return 0
+            fi
+            warn "Volume ter-lampir tetapi belum terverifikasi."
+        else
+            warn "Gagal melampirkan volume '${VOLUME_NAME}':"
+            sed 's/^/    /' /tmp/railway-volume.log >&2 || true
+            warn "Volume mungkin masih terpasang di service lain. Akan dibuat volume baru."
+        fi
+    fi
+
+    if [ "$ignored_detached" -gt 0 ]; then
+        warn "Ada ${ignored_detached} volume detached di /data yang namanya tidak cocok dengan service '${SERVICE_NAME}'; tidak dipakai otomatis."
+        warn "Kalau itu volume lama service ini, attach manual: railway volume --service ${SERVICE_ID:-<service-id>} attach --volume <id> --yes"
+    fi
+
+    # Service ini belum punya volume. Preflight di atas sudah memberi tahu
+    # kalau ada data ephemeral yang perlu dimigrasikan.
+    info "Service '${SERVICE_NAME}' belum punya volume /data; membuat volume baru..."
+    if ! volume_cmd add --mount-path /data --json >/tmp/railway-volume.log 2>&1; then
+        # Kadang volume sudah terbentuk tetapi output perintah gagal.
+        if refresh_attached_volume && ensure_volume_mount_path; then
+            VOLUME_CHANGED=1
+            VOLUME_CREATED=1
+            info "Volume /data sudah terpasang (${VOLUME_NAME})."
+            return 0
+        fi
+        warn "Gagal membuat volume /data:"
+        sed 's/^/    /' /tmp/railway-volume.log >&2 || true
+        warn "Tambahkan manual: Railway → service → Settings → Volumes → Add Volume → /data"
+        return 1
+    fi
+    VOLUME_CHANGED=1
+    VOLUME_CREATED=1
+
+    if ! wait_for_attached_volume; then
+        warn "Volume baru belum terlihat di service '${SERVICE_NAME}' setelah 30 detik."
+        warn "Cek: railway volume list --json"
+        return 1
+    fi
+
+    if ! ensure_volume_mount_path; then
+        return 1
+    fi
+
+    info "Volume /data dibuat dan terpasang (${VOLUME_NAME})."
+    return 0
+}
+
+# Resolve service ID setelah service di-link. Ini membuat operasi volume
+# ter-scope ke service ini walau service lain punya volume /data.
+if resolve_service_id; then
+    info "Service ID: ${SERVICE_ID}"
+else
+    warn "Service ID tidak terbaca; perintah volume akan memakai service yang ter-link."
+fi
+
+info "Memastikan volume persisten..."
+if ! ensure_volume; then
+    die "Volume /data wajib terpasang agar session & workspace tidak hilang saat redeploy."
+fi
+if [ "$VOLUME_CHANGED" -eq 1 ]; then
+    info "Volume berubah; deployment setelah ini akan me-mount /data."
+fi
+if [ -n "$MIGRATION_BACKUP_DIR" ]; then
+    if ! restore_migration_backup; then
+        die "Upload backup ke volume gagal. Data lama masih aman di ${MIGRATION_BACKUP_DIR}; redeploy dibatalkan. Perbaiki error lalu upload manual dengan 'railway volume files --volume <id> upload ... / --overwrite'."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Variables
+#
+# Diset setelah volume siap. Dengan begitu, kalau CLI lama memicu redeploy saat
+# variable berubah, data ephemeral sudah sempat dimigrasikan/diamankan lebih
+# dulu.
 # ---------------------------------------------------------------------------
 if railway variable set --help >/dev/null 2>&1; then
     SETVAR_MODE="new"
@@ -248,6 +804,10 @@ set_var OPENCODE_DISABLE_AUTOUPDATE "true"
 set_var OPENCODE_AUTO_UPDATE "${OPENCODE_AUTO_UPDATE:-true}"
 set_var OPENCODE_AUTO_UPDATE_INTERVAL "${OPENCODE_AUTO_UPDATE_INTERVAL:-21600}"
 set_var OPENCODE_LOW_RESOURCE "${OPENCODE_LOW_RESOURCE:-true}"
+set_var OPENCODE_HOME "${OPENCODE_HOME:-}"
+set_var OPENCODE_PASSWORD_FILE "${OPENCODE_PASSWORD_FILE:-}"
+set_var OPENCODE_DB "${OPENCODE_DB:-}"
+set_var ALLOW_EPHEMERAL_DATA "${ALLOW_EPHEMERAL_DATA:-}"
 
 # Provider model (opsional). Hanya yang terisi yang dikirim.
 for var in \
@@ -265,49 +825,6 @@ for var in \
 do
     set_var "$var" "${!var:-}"
 done
-
-# ---------------------------------------------------------------------------
-# Volume persisten
-# ---------------------------------------------------------------------------
-volume_has_data_path() {
-    local json
-    json="$(railway volume list --json 2>/dev/null || true)"
-    if [ -n "$json" ]; then
-        printf '%s' "$json" \
-            | grep -Eq '"mountPath"[[:space:]]*:[[:space:]]*"/data"|"/data"' \
-            && return 0
-    fi
-    railway volume list 2>/dev/null | grep -q '/data' && return 0
-    return 1
-}
-
-ensure_volume() {
-    if volume_has_data_path; then
-        info "Volume /data sudah terpasang."
-        return 0
-    fi
-
-    warn "Volume /data belum ada. Menambahkannya sekarang..."
-    warn "Kalau service ini sudah pernah jalan, isi /data lama akan tertutup volume baru."
-    if railway volume add --mount-path /data >/tmp/railway-volume.log 2>&1; then
-        info "Volume /data ditambahkan."
-        return 0
-    fi
-
-    # Kadang perintah add gagal karena volume sudah ada; cek ulang.
-    if volume_has_data_path; then
-        info "Volume /data sudah terpasang."
-        return 0
-    fi
-
-    warn "Gagal menambahkan volume /data:"
-    sed 's/^/    /' /tmp/railway-volume.log >&2 || true
-    warn "Tambahkan manual: service → Settings → Volumes → Add Volume → mount path /data"
-    return 1
-}
-
-info "Memastikan volume persisten..."
-ensure_volume || die "Volume /data wajib ada agar session & workspace tidak hilang saat redeploy."
 
 # ---------------------------------------------------------------------------
 # Public networking (HTTP domain + TCP proxy)
